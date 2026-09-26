@@ -76,7 +76,16 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      await entry.client.connect();
+      // The WebSocket may already be up from a previous pair attempt. If so,
+      // connect() throws "websocket is already connected". We don't care —
+      // we only need the WS to exist before requesting a pairing code.
+      try {
+        await entry.client.connect();
+      } catch (e) {
+        const m = String(e?.message || e);
+        if (!/already connected/i.test(m)) throw e;
+      }
+
       const code = await entry.client.pairCode(cleanPhone);
 
       res.end(JSON.stringify({ ok: true, code }));
@@ -129,6 +138,7 @@ const server = http.createServer(async (req, res) => {
 
       try {
         // 3. ffmpeg → OGG / Opus / 16kHz / mono.
+        //    This is the format WhatsApp expects for a voice note that plays on iOS.
         await execAsync(
           `ffmpeg -y -i "${inPath}" ` +
           `-vn -c:a libopus -b:a 32k -ar 16000 -ac 1 ` +
