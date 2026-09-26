@@ -1,4 +1,4 @@
-import { createClient } from 'whatsmeow-node';
+import { createClient } from '@whatsmeow-node/whatsmeow-node';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs/promises';
@@ -19,33 +19,16 @@ if (!SUPABASE_DB_URL || !APP_BASE_URL) {
 }
 
 // One whatsmeow client per user, keyed by userId.
-// Each client uses the same Supabase Postgres as its store, so sessions persist.
-// whatsmeow-node stores per-device rows; using one client per user keeps them isolated.
 const clients = new Map();   // userId -> { client, jid, connected }
-
-// ---- helpers ----
-
-// whatsmeow-node's store option takes a Postgres URL or an SQLite path.
-// For multiple users against the same Postgres, each client needs its own store
-// to avoid clobbering each other's device rows. We append a suffix per user.
-function storeForUser(userId) {
-  // The library accepts a Postgres URL; we point all users at the same DB but
-  // the library namespaces by device JID internally, so this is safe.
-  return SUPABASE_DB_URL;
-}
 
 async function getOrCreateClient(userId) {
   if (clients.has(userId)) return clients.get(userId);
 
-  const client = createClient({
-    store: storeForUser(userId),
-    // binaryPath auto-resolves from the platform package
-  });
+  const client = createClient({ store: SUPABASE_DB_URL });
 
   const entry = { client, jid: null, connected: false };
   clients.set(userId, entry);
 
-  // Auto-reconnect is on by default in whatsmeow-node.
   client.on('connected', ({ jid }) => {
     entry.jid = jid;
     entry.connected = true;
@@ -68,7 +51,6 @@ async function getOrCreateClient(userId) {
 // ---- the three endpoints ----
 
 const server = http.createServer(async (req, res) => {
-  // Minimal body reader — no express, keeps the service tiny.
   const chunks = [];
   for await (const c of req) chunks.push(c);
   const raw = Buffer.concat(chunks).toString('utf8');
@@ -86,7 +68,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const cleanPhone = String(phone).replace(/[^0-9]/g, '');   // digits only, with country code
+      const cleanPhone = String(phone).replace(/[^0-9]/g, '');
       const entry = await getOrCreateClient(userId);
 
       if (entry.connected) {
@@ -94,7 +76,6 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Pairing code flow requires connect() before requesting the code.
       await entry.client.connect();
       const code = await entry.client.pairCode(cleanPhone);
 
@@ -148,9 +129,6 @@ const server = http.createServer(async (req, res) => {
 
       try {
         // 3. ffmpeg → OGG / Opus / 16kHz / mono.
-        //    This is the format WhatsApp expects for a voice note that plays on iOS.
-        //    -application voip and avoid_negative_ts make_zero match what the
-        //    Baileys maintainers converged on for waveform-compatible PTT notes.
         await execAsync(
           `ffmpeg -y -i "${inPath}" ` +
           `-vn -c:a libopus -b:a 32k -ar 16000 -ac 1 ` +
@@ -162,18 +140,22 @@ const server = http.createServer(async (req, res) => {
         const oggBuf = await fs.readFile(outPath);
 
         // 4. Upload then send with ptt: true so it renders as a voice note.
-        const uploaded = await entry.client.uploadMedia(outPath, 'audio');
+        const media = await entry.client.uploadMedia(outPath, 'audio');
         await entry.client.sendRawMessage(to, {
           audioMessage: {
-            ...uploaded,
+            URL: media.URL,
+            directPath: media.directPath,
+            mediaKey: media.mediaKey,
+            fileEncSHA256: media.fileEncSHA256,
+            fileSHA256: media.fileSHA256,
+            fileLength: String(media.fileLength),
+            mimetype: 'audio/ogg; codecs=opus',
             ptt: true,
-            mimetype: 'audio/ogg; codecs=opus'
           }
         });
 
         res.end(JSON.stringify({ ok: true, to, bytes: oggBuf.length }));
       } finally {
-        // 5. Delete the temp files. Nothing is kept.
         await fs.unlink(inPath).catch(() => {});
         await fs.unlink(outPath).catch(() => {});
       }
