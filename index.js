@@ -195,7 +195,7 @@ const server = http.createServer(async (req, res) => {
             fileSHA256: media.fileSHA256,
             fileLength: String(media.fileLength),
             mimetype: 'audio/ogg; codecs=opus',
-            ptt: true,
+            PTT: true,
           }
         });
 
