@@ -41,7 +41,10 @@ async function getOrCreateClient(userId) {
   if (clients.has(userId)) return clients.get(userId);
 
   const storeUrl = await storeUrlForUser(userId);
-  const client = createClient({ store: storeUrl });
+  const client = createClient({ 
+  store: storeUrl,
+  commandTimeout: 120000  // 120 seconds (2 minutes)
+});
 
   const entry = { client, jid: null, connected: false };
   clients.set(userId, entry);
