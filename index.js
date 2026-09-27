@@ -5,26 +5,43 @@ import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import http from 'http';
+import pg from 'pg';
 
 const execAsync = promisify(exec);
+const { Pool } = pg;
 
 // ---- config ----
 const PORT = process.env.PORT || 3000;
-const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL;      // postgres://...
-const APP_BASE_URL = process.env.APP_BASE_URL;            // https://voice-seb4.onrender.com
+const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL;
+const APP_BASE_URL = process.env.APP_BASE_URL;
+const BRIDGE_SECRET = process.env.BRIDGE_SECRET;
 
-if (!SUPABASE_DB_URL || !APP_BASE_URL) {
-  console.error('Missing SUPABASE_DB_URL or APP_BASE_URL');
+if (!SUPABASE_DB_URL || !APP_BASE_URL || !BRIDGE_SECRET) {
+  console.error('Missing required environment variables: SUPABASE_DB_URL, APP_BASE_URL, BRIDGE_SECRET');
   process.exit(1);
 }
 
+// A single pool for creating per-user schemas.
+const adminPool = new Pool({ connectionString: SUPABASE_DB_URL });
+
 // One whatsmeow client per user, keyed by userId.
-const clients = new Map();   // userId -> { client, jid, connected }
+const clients = new Map();
+
+async function storeUrlForUser(userId) {
+  // Sanitize userId into a valid Postgres schema name.
+  const safe = String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 40) || 'default';
+  const schema = `wa_${safe}`;
+  // Whitelisted characters, so no SQL injection path here.
+  await adminPool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
+  const sep = SUPABASE_DB_URL.includes('?') ? '&' : '?';
+  return `${SUPABASE_DB_URL}${sep}options=-csearch_path%3D${schema}`;
+}
 
 async function getOrCreateClient(userId) {
   if (clients.has(userId)) return clients.get(userId);
 
-  const client = createClient({ store: SUPABASE_DB_URL });
+  const storeUrl = await storeUrlForUser(userId);
+  const client = createClient({ store: storeUrl });
 
   const entry = { client, jid: null, connected: false };
   clients.set(userId, entry);
@@ -48,9 +65,23 @@ async function getOrCreateClient(userId) {
   return entry;
 }
 
-// ---- the three endpoints ----
+// ---- the server ----
 
 const server = http.createServer(async (req, res) => {
+  // CORS — without these, browsers discard responses and report
+  // "Failed to fetch" even when the server answered correctly.
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Bridge-Secret');
+
+  // Browsers send an OPTIONS preflight before any POST that carries a custom
+  // header like X-Bridge-Secret. Answer it here and return early. No body to
+  // read, no secret to check on a preflight.
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204).end();
+    return;
+  }
+
   const chunks = [];
   for await (const c of req) chunks.push(c);
   const raw = Buffer.concat(chunks).toString('utf8');
@@ -58,6 +89,13 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  // Shared-secret gate. Every real request must carry it.
+  const providedSecret = req.headers['x-bridge-secret'];
+  if (providedSecret !== BRIDGE_SECRET) {
+    res.writeHead(401).end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
+    return;
+  }
 
   try {
     // ---- POST /pair ----
@@ -76,9 +114,8 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // The WebSocket may already be up from a previous pair attempt. If so,
-      // connect() throws "websocket is already connected". We don't care —
-      // we only need the WS to exist before requesting a pairing code.
+      // The WebSocket may already be up from a previous attempt. If so,
+      // connect() throws "already connected", which is harmless here.
       try {
         await entry.client.connect();
       } catch (e) {
@@ -87,7 +124,6 @@ const server = http.createServer(async (req, res) => {
       }
 
       const code = await entry.client.pairCode(cleanPhone);
-
       res.end(JSON.stringify({ ok: true, code }));
       return;
     }
@@ -128,7 +164,7 @@ const server = http.createServer(async (req, res) => {
       }
       const inputBuf = Buffer.from(await audioRes.arrayBuffer());
 
-      // 2. Temp files — the file only lives on disk for the length of this request.
+      // 2. Temp files — live on disk only for the length of this request.
       const tmpDir = os.tmpdir();
       const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const inPath  = path.join(tmpDir, `wa-${stamp}.wav`);
@@ -137,8 +173,7 @@ const server = http.createServer(async (req, res) => {
       await fs.writeFile(inPath, inputBuf);
 
       try {
-        // 3. ffmpeg → OGG / Opus / 16kHz / mono.
-        //    This is the format WhatsApp expects for a voice note that plays on iOS.
+        // 3. ffmpeg → OGG / Opus / 16kHz / mono. Required for iOS playback.
         await execAsync(
           `ffmpeg -y -i "${inPath}" ` +
           `-vn -c:a libopus -b:a 32k -ar 16000 -ac 1 ` +
